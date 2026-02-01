@@ -1,0 +1,605 @@
+clear; clc; close all;
+
+%% ========================================================================
+%  1. SYSTEM AND CONTROL PARAMETERS
+% ========================================================================
+Mm      = 1.0;        % Motor side inertia [kg m^2]
+M       = 2.0;        % Link side inertia [kg m^2]
+K       = 1004.0;     % Elastic stiffness [Nm/rad]
+Ts      = 0.001;      % Sampling time [s]
+    % Simulation duration [s]
+    
+rng(42);              % Set random seed for reproducibility
+
+% Controller Gains
+K_p_theta = 70.07;     
+K_d_theta = 46.93;      
+K_p_tau   = 6.11;     
+K_d_tau   = 0.91;   
+ 
+% Noise Parameters (Defined here for clarity)
+STD_NOISE_THETA = 10e-4;  % Theta noise standard deviation
+STD_NOISE_TAU   = 0.1;    % Tau_J noise standard deviation, really high to test the method, affects validation
+VAR_NOISE_THETA = STD_NOISE_THETA^2;
+VAR_NOISE_TAU   = STD_NOISE_TAU^2;
+
+% Assignment to Workspace for Simulink
+assignin('base', 'K', K);
+assignin('base', 'Mm', Mm);
+assignin('base', 'M', M);
+assignin('base', 'Kp_theta', K_p_theta);
+assignin('base', 'Kd_theta', K_d_theta);
+assignin('base', 'Kp_tau',   K_p_tau);
+assignin('base', 'Kd_tau',   K_d_tau);
+assignin('base', 'VAR_NOISE_THETA', VAR_NOISE_THETA);
+assignin('base', 'VAR_NOISE_TAU',   VAR_NOISE_TAU);
+assignin('base', 'Ts', Ts);
+
+
+Ts = 0.001;           
+T_total = 40.0;        
+t_vec   = (0:Ts:T_total)';
+syms t 
+pi_sym = sym(pi);
+
+
+q_sym = (pi_sym/2) * sin((pi_sym/3) * t);
+
+
+q_dot_sym = diff(q_sym, t);
+q_ddot_sym = diff(q_dot_sym, t);
+
+
+func_q      = matlabFunction(q_sym);
+func_q_dot  = matlabFunction(q_dot_sym);
+func_q_ddot = matlabFunction(q_ddot_sym);
+
+
+q_vals      = func_q(t_vec);
+q_dot_vals  = func_q_dot(t_vec);
+q_ddot_vals = func_q_ddot(t_vec);
+
+
+figure; 
+subplot(3,1,1); plot(t_vec, q_vals); title('Position'); grid on;
+subplot(3,1,2); plot(t_vec, q_dot_vals); title('Velocity'); grid on;
+subplot(3,1,3); plot(t_vec, q_ddot_vals); title('Acceleration'); grid on;
+
+
+
+tau_Jd_vec = M * q_ddot_vals;
+
+
+
+theta_d_vec = (tau_Jd_vec/K) + q_vals;
+
+
+ 
+theta_d_input = [t_vec, theta_d_vec];
+tau_jd_input  = [t_vec, tau_Jd_vec];
+
+assignin('base','theta_d_input',theta_d_input);
+assignin('base','tau_jd_input', tau_jd_input);
+
+
+
+mdl = 'modello_controllore3';  
+
+disp('Fase 3: Execution of simulink simulation...');
+
+try
+    simOut = sim(mdl, 'StopTime', num2str(T_total), ...
+                 'SaveOutput','on', 'SignalLogging','on');
+    fprintf('Simulation completed.\n');
+
+    % output from the toworkspace 
+    theta_ts = simOut.theta;
+    tauJ_ts  = simOut.tau_J;
+
+    theta_data = theta_ts.Data;
+    t_theta    = theta_ts.Time;
+
+    tau_J_data = tauJ_ts.Data;
+    t_tau_J    = tauJ_ts.Time;
+
+    % motor control
+    if isprop(simOut,'tau_ctrl')
+        tau_ctrl_ts   = simOut.tau_ctrl;
+    else
+        error('tau_ctrl missing.');
+    end
+
+    tau_u_data = tau_ctrl_ts.Data;
+    t_tau_u    = tau_ctrl_ts.Time;
+
+catch ME
+    fprintf('\n\n simulation failed \n');
+    disp(ME.message);
+    error('error');
+end
+
+t_meas      = t_theta(:);
+theta_clean_out  = theta_data(:);
+tau_J_clean_out  = tau_J_data(:);
+tau_u_val  = tau_u_data(:);
+
+theta_meas   = theta_clean_out  + STD_NOISE_THETA   * randn(size(theta_clean_out));
+tau_J_meas   = tau_J_clean_out   + STD_NOISE_TAU   * randn(size(tau_J_clean_out));
+
+
+%% ========================================================================
+%  TAU_J AND THETA_DOT DERIVATIVES CALCULATION WITH PRE-FILTERING, THIS
+%  COMPUTATION IS ONLY PERFORMED FOR PLOTS PURPOSES. A NEW COMPUTATION WILL
+%  BE DISPLAYED NEXT, BUT THE STEPS AND RESULTS ARE THE SAME
+% ========================================================================
+dt = mean(diff(t_vec));
+N = length(t_vec);
+
+% since the main signal component is at 0.7 Hz, we can set a cutoff
+% frequency slightly above that to preserve the signal while attenuating noise.
+ 
+fc = 5;        
+fs = 1/dt;     
+[b, a] = butter(2, fc/(fs/2), 'low');
+
+theta_clean = filtfilt(b, a, theta_meas);
+
+
+
+% 3. finite derivative taking a total of 7 points (3 before and 3 after)
+% only after we have the clean signal we can procede to calculate the derivatives
+theta_ddot_final = zeros(N, 1);
+coeffs_d2 = [2; -27; 270; -490; 270; -27; 2];
+
+for i = 4 : (N - 3)
+    idx = (i-3) : (i+3);
+    
+    th_win  = theta_clean(idx); 
+    theta_ddot_final(i) = (th_win' * coeffs_d2) / (180 * dt^2);
+end
+
+theta_ddot_calc = fillmissing(theta_ddot_final, 'nearest');
+
+
+fc = 5;        
+fs = 1/dt;    
+[b, a] = butter(2, fc/(fs/2), 'low');
+
+
+tau_J_meas_clean = filtfilt(b, a, tau_J_meas);
+
+
+
+
+fc = 5;
+fs = 1/dt;
+[b, a] = butter(2, fc/(fs/2), 'low');
+theta_ddot_filt = filtfilt(b, a, theta_ddot_calc);
+
+q_reconstructed = theta_clean - (tau_J_meas_clean / K);
+
+tau_elastic_term = K * (theta_clean - q_reconstructed);
+
+tau_reconstructed = (Mm * theta_ddot_filt) + tau_elastic_term;
+
+buffer = 50;
+valid_idx = buffer : (N - buffer);
+
+t_plot = t_vec(valid_idx);
+tau_real = tau_u_val(valid_idx);
+tau_est  = tau_reconstructed(valid_idx);
+
+err_tau = tau_real - tau_est;
+rmse_tau = sqrt(mean(err_tau.^2));
+fit_percent = 100 * (1 - norm(err_tau)/norm(tau_real - mean(tau_real)));
+
+figure('Name', 'Torque reconstruction', 'Color', 'w'); %just to check wether the computed torque makes sense
+
+subplot(2,1,1);
+plot(t_plot, tau_real, 'b', 'LineWidth', 1.5); hold on;
+plot(t_plot, tau_est, 'r--', 'LineWidth', 1.5);
+title(['Motor torque: True vs Reconstructed (Fit: ' num2str(fit_percent, '%.2f') '%)']);
+ylabel('Coppia [Nm]');
+legend('Tau Control (Sensor)', 'Tau Reconstructed (Inverse model)');
+grid on;
+
+subplot(2,1,2);
+plot(t_plot, err_tau, 'k');
+title(['Reconstruction Error (RMSE: ' num2str(rmse_tau, '%.4f') ' Nm)']);
+xlabel('Time [s]'); ylabel('Error [Nm]');
+grid on;
+
+
+
+
+%% ========================================================================
+%  ACCELERATION ANALYSIS PLOT (Raw vs Filtered)
+% ========================================================================
+figure('Name', 'Numerical Derivative Analysis', 'Color', 'w');
+hold on; grid on;
+
+
+h_raw = plot(t_vec(valid_idx), theta_ddot_calc(valid_idx), ...
+             'Color', [0.7 0.7 0.7], 'LineWidth', 0.5);
+
+% 2. plot of "Filtered" acceleration (Butterworth + Filtfilt)
+%    this is the signal used to reconstruct the torque.
+h_filt = plot(t_vec(valid_idx), theta_ddot_filt(valid_idx), ...
+              'b', 'LineWidth', 2);
+
+% 3.  Legend
+xlabel('Time [s]', 'FontSize', 12);
+ylabel('Angular Acceleration [rad/s^2]', 'FontSize', 12);
+title('Effect of Filtering on Numerical Derivative', 'FontSize', 14);
+
+legend([h_raw, h_filt], ...
+       'Raw Acceleration (Noise)', ...
+       'Filtered Acceleration (Clean)', ...
+       'Location', 'best');
+
+
+
+% creation of the unique matrix [time, theta, tau_j]
+% this is the matrix you will use for filtering
+matrice_dati_sensori = [t_meas, theta_meas, tau_J_meas];
+
+theta_d_resampled = interp1(t_vec, theta_d_vec, t_theta, 'linear', 'extrap');
+
+% calculation of the tracking error
+error_theta = theta_d_resampled - theta_data;
+
+% --- figure 1: position tracking (motor) ---
+figure('Name', 'Motor Position Tracking', 'Color', 'w');
+subplot(2,1,1);
+    plot(t_vec, theta_d_vec, 'r--', 'LineWidth', 1.5); hold on;
+    plot(t_theta, theta_data, 'b', 'LineWidth', 1.2);
+    grid on; grid minor;
+    ylabel('Position [rad]');
+    legend('Theta Desired (Ref)', 'Theta Measured (Sim)', 'Location', 'best');
+    title('Trajectory tracking: \theta_{des} vs \theta_{meas}');
+subplot(2,1,2);
+    plot(t_theta, error_theta, 'k', 'LineWidth', 1.0);
+    grid on; grid minor;
+    ylabel('Error [rad]');
+    xlabel('Time [s]');
+    title(['Tracking error (Max: ' num2str(max(abs(error_theta)), '%.4f') ' rad)']);
+
+% --- figure 2: torque analysis (control effort) ---
+figure('Name', 'Torque Analysis', 'Color', 'w');
+subplot(2,1,1);
+    plot(t_tau_u, tau_u_data, 'b', 'LineWidth', 1.2); hold on;
+    % adding saturation limits (if any, e.g. +/- 100nm) for visual reference
+    yline(100, 'r--'); yline(-100, 'r--'); 
+    grid on;
+    ylabel('Motor Torque [Nm]');
+    title('Control Torque (\tau_{ctrl})');
+    legend('PID Output', 'Limits (hypothetical)');
+subplot(2,1,2);
+    plot(t_tau_J, tau_J_data, 'g', 'LineWidth', 1.2); hold on;
+    plot(t_vec, tau_Jd_vec, 'm--', 'LineWidth', 1.5);
+    grid on;
+    ylabel('Joint Torque [Nm]');
+    xlabel('Time [s]');
+    legend('Joint Tau (Measured)', 'Joint Tau (Ideal)', 'Location', 'best');
+    title('Torque Transmitted through the Spring');
+
+
+% --- figure 3: elastic effect (motor-link difference) ---
+% note: this plot makes sense if you also extract 'q' (link side) from simulink.
+% if you don't have it, let's visualize the estimated spring deformation: (tau_j / k)
+deformazione_molla = tau_J_data / K;
+
+figure('Name', 'Elastic Effects', 'Color', 'w');
+plot(t_tau_J, deformazione_molla * 180/pi, 'Color', [0.8500 0.3250 0.0980], 'LineWidth', 1.5);
+grid on;
+title('Spring Angular Deformation (\theta - q)');
+ylabel('Deflection [degrees]');
+xlabel('Time [s]');
+subtitle('How much the joint "flexes" during movement');
+
+
+%% ========================================================================
+%  DATA ELABORATION: FILTERING -> DIFFERENTIATION -> MATRIX
+% ========================================================================
+
+% prepare the data
+t_proc      = t_theta(:);
+
+
+
+
+theta_raw   = theta_meas  + STD_NOISE_THETA   * randn(size(theta_meas));
+tau_J_raw   = tau_J_meas   + STD_NOISE_TAU   * randn(size(tau_J_meas));
+
+
+
+
+dt = mean(diff(t_proc)); 
+N_samples = length(t_proc);
+
+% we apply a ButterWorth filter with cut off frequency = 1, as before
+fc = 5;       % cut off frequency
+fs = 1/dt;    % sampling freq
+[c, d] = butter(2, fc/(fs/2), 'low'); 
+
+% we apply the filter
+theta_filt = filtfilt(c, d, theta_raw);
+tau_J_filt = filtfilt(c, d, tau_J_raw);
+
+
+
+
+
+
+% coefficients for first and second order derivative
+coeffs_d1 = [-1; 9; -45; 0; 45; -9; 1];       
+coeffs_d2 = [2; -27; 270; -490; 270; -27; 2]; 
+
+
+th_dot   = zeros(N_samples, 1);
+th_ddot  = zeros(N_samples, 1);
+tau_dot  = zeros(N_samples, 1);
+
+for i = 4 : (N_samples - 3)
+    idx = (i-3) : (i+3);
+    
+    % we take the filtered data and then we compute the derivative
+    win_th  = theta_filt(idx);
+    win_tau = tau_J_filt(idx);
+    
+   
+    th_dot(i)  = (win_th' * coeffs_d1) / (60 * dt);
+    th_ddot(i) = (win_th' * coeffs_d2) / (180 * dt^2);
+    tau_dot(i) = (win_tau' * coeffs_d1) / (60 * dt);
+end
+
+%interpolate the missing values which do not have neighbor. basically the
+%last values will take the value of the nearest neighbor.
+th_dot  = fillmissing(th_dot, 'nearest');
+th_ddot = fillmissing(th_ddot, 'nearest');
+tau_dot = fillmissing(tau_dot, 'nearest');
+
+%we can now start to build the regressor matrix
+buffer = 50; 
+
+valid_idx = buffer : (N_samples - buffer);
+% matrix columns: 
+% [1:time, 2:theta_filt, 3:tau_j_filt, 4:th_dot, 5:th_ddot, 6:tau_dot]
+Matrix_LS_Ready = [ ...
+    t_proc(valid_idx), ...      % 1. time
+    theta_filt(valid_idx), ...  % 2. position (filtered)
+    tau_J_filt(valid_idx), ...  % 3. joint torque (filtered)
+    th_dot(valid_idx), ...      % 4. motor velocity (calculated on filtered)
+    th_ddot(valid_idx), ...     % 5. motor accel (calculated on filtered)
+    tau_dot(valid_idx), ...     % 6. torque derivative (calculated on filtered)
+    
+];
+fprintf('processing completed.\n');
+fprintf('data filtered at source and then differentiated.\n');
+fprintf('matrix ready: %d rows x 6 columns.\n', size(Matrix_LS_Ready,1));
+
+
+%% ========================================================================
+%  LEAST SQUARES
+% ========================================================================
+
+% data estraction
+% Matrix_LS_Ready = [t, theta, tau, th_dot, th_ddot, tau_dot, tau_ddot]
+t_est       = Matrix_LS_Ready(:, 1);
+theta_meas  = Matrix_LS_Ready(:, 2);
+tau_meas    = Matrix_LS_Ready(:, 3);
+th_dot_meas = Matrix_LS_Ready(:, 4);
+th_ddot_meas= Matrix_LS_Ready(:, 5);
+tau_dot_meas= Matrix_LS_Ready(:, 6);
+
+% just for safety we rebuild the reference value  
+syms t_sym_k
+pi_sym = sym(pi);
+q_sym_ref = (pi_sym/2) * sin((pi_sym/3) * t_sym_k);
+
+f_q      = matlabFunction(q_sym_ref);
+f_q_ddot = matlabFunction(diff(diff(q_sym_ref, t_sym_k), t_sym_k));
+
+% ideal data
+q_d      = f_q(t_est);
+q_ddot_d = f_q_ddot(t_est);
+
+% dynamic inversion
+tau_Jd_ref  = M * q_ddot_d;                 
+theta_d_ref = q_d + (tau_Jd_ref / K);
+
+
+%tau_mes is the elastic torque
+Y_target = (Mm * th_ddot_meas) + tau_meas;
+
+% 4. construction of regressor matrix (phi)
+% model: tau = kp_tau*err_tau - kd_tau*d_tau + kp_th*err_th - kd_th*d_th
+
+% col 1: torque error (kp_tau)
+col_Kp_tau   = tau_Jd_ref - tau_meas;
+
+% col 2: -torque derivative (kd_tau)
+col_Kd_tau   = -tau_dot_meas;
+
+% col 3: position error (kp_theta)
+col_Kp_theta = theta_d_ref - theta_meas;
+
+% col 4: -motor velocity (kd_theta)
+col_Kd_theta = -th_dot_meas;
+
+% phi assembly
+Phi = [col_Kp_tau, col_Kd_tau, col_Kp_theta, col_Kd_theta];
+
+% 5. least squares solution
+Gains_est = pinv(Phi)*Y_target;
+
+% 6. results
+Kpt_est  = Gains_est(1);
+Kdt_est  = Gains_est(2);
+Kpth_est = Gains_est(3);
+Kdth_est = Gains_est(4);
+
+fprintf('\n------------------------------------------------\n');
+fprintf(' estimation results (without feedforward)\n');
+fprintf('------------------------------------------------\n');
+fprintf('kp_tau   (real: %.2f) -> estimated: %.4f\n', K_p_tau, Kpt_est);
+fprintf('kd_tau   (real: %.2f) -> estimated: %.4f\n', K_d_tau, Kdt_est);
+fprintf('kp_theta (real: %.2f) -> estimated: %.4f\n', K_p_theta, Kpth_est);
+fprintf('kd_theta (real: %.2f) -> estimated: %.4f\n', K_d_theta, Kdth_est);
+fprintf('------------------------------------------------\n');
+
+
+
+
+
+%% ========================================================================
+%   validation on rest-to-rest trajectory 
+% ========================================================================
+fprintf('\n=== validation (quintic rest-to-rest) ===\n');
+
+% --- 1. definition of parameters and time ---
+Movement_Amplitude = 0.5;   % [rad] 
+Movement_Duration  = 3.0;   % [s] 
+Pause_Duration     = 1.0;   % [s] 
+T_val_total        = Movement_Duration + Pause_Duration;
+t_val = 0:Ts:T_val_total;
+t_val = t_val(:); 
+
+% --- 2. trajectory generation (vectorial) ---
+% normalized q(t): s(tau) = 10*tau^3 - 15*tau^4 + 6*tau^5
+q_val   = zeros(size(t_val));
+v_val   = zeros(size(t_val)); 
+acc_val = zeros(size(t_val)); 
+idx_move = t_val <= Movement_Duration;
+tau_norm = t_val(idx_move) / Movement_Duration; 
+
+% profile calculation
+q_val(idx_move) = Movement_Amplitude * (10*tau_norm.^3 - 15*tau_norm.^4 + 6*tau_norm.^5);
+q_val(~idx_move) = Movement_Amplitude; 
+v_val(idx_move) = (Movement_Amplitude / Movement_Duration) * (30*tau_norm.^2 - 60*tau_norm.^3 + 30*tau_norm.^4);
+acc_val(idx_move) = (Movement_Amplitude / Movement_Duration^2) * (60*tau_norm - 180*tau_norm.^2 + 120*tau_norm.^3);
+
+% --- 3. simulink input preparation ---
+tau_jd_val_vec  = M * acc_val;
+theta_d_val_vec = q_val + tau_jd_val_vec / K;
+
+% input timeseries
+theta_d_input = timeseries(theta_d_val_vec, t_val);
+tau_jd_input  = timeseries(tau_jd_val_vec, t_val);
+
+assignin('base', 'theta_d_input', theta_d_input);
+assignin('base', 'tau_jd_input',  tau_jd_input);
+assignin('base', 'K', K); assignin('base', 'Mm', Mm); assignin('base', 'M', M);
+
+% --- 4. simulation execution ---
+disp('running validation simulation...');
+try
+    simOutVal = sim(mdl, 'StopTime', num2str(T_val_total), 'SaveOutput', 'on');
+    
+    % --- simplified data extraction (for timeseries) ---
+    % use the .get() method which works on both dataset and simulationoutput
+    
+    % 1. theta
+    ts_th = simOutVal.get('theta');
+    if isempty(ts_th), error('signal "theta" not found.'); end
+    t_v      = ts_th.Time;
+    th_v_raw = ts_th.Data;
+    
+  % 2. tau_j
+    ts_tau = simOutVal.get('tau_J');
+    if isempty(ts_tau), error('signal "tau_j" not found.'); end
+    tau_v_raw = ts_tau.Data;
+    
+    % 3. tau_ctrl (search for various possible names)
+    ts_ctrl = simOutVal.get('tau_ctrl');
+    if isempty(ts_ctrl), ts_ctrl = simOutVal.get('tau_u'); end
+    if isempty(ts_ctrl), ts_ctrl = simOutVal.get('u'); end
+    
+    if isempty(ts_ctrl)
+        error('control signal (tau_ctrl) not found. check the to workspace block.'); 
+    end
+    tau_ctrl_v_raw = ts_ctrl.Data;
+    
+catch ME
+    disp('--- simulation error ---');
+    disp(ME.message);
+    return;
+end
+
+% --- 5. post-processing ---
+% noise addition
+th_v_noisy  = th_v_raw  + STD_NOISE_THETA * randn(size(th_v_raw));
+tau_v_noisy = tau_v_raw + STD_NOISE_TAU   * randn(size(tau_v_raw));
+
+% filter
+fc = 5; fs = 1/mean(diff(t_v));    
+[b_filt, a_filt] = butter(2, fc/(fs/2), 'low'); 
+theta_v_filt    = filtfilt(b_filt, a_filt, th_v_noisy);
+tau_v_filt      = filtfilt(b_filt, a_filt, tau_v_noisy);
+tau_ctrl_v_filt = filtfilt(b_filt, a_filt, tau_ctrl_v_raw); 
+
+% derivatives
+dt_v = mean(diff(t_v));
+N_v = length(t_v);
+th_dot_v  = zeros(N_v, 1);
+tau_dot_v = zeros(N_v, 1);
+coeffs_d1 = [-1; 9; -45; 0; 45; -9; 1];
+
+for i = 4 : (N_v - 3)
+    idx = (i-3) : (i+3);
+    th_dot_v(i)  = (theta_v_filt(idx)' * coeffs_d1) / (60 * dt_v);
+    tau_dot_v(i) = (tau_v_filt(idx)' * coeffs_d1) / (60 * dt_v);
+end
+
+th_dot_v  = fillmissing(th_dot_v, 'nearest');
+tau_dot_v = fillmissing(tau_dot_v, 'nearest');
+
+% --- 6. parameter validation ---
+buf = 50; %here we can change the value to limit border effects 
+idx_valid = buf : (N_v - buf);
+tv_c     = t_v(idx_valid);
+th_c     = theta_v_filt(idx_valid);
+tau_c    = tau_v_filt(idx_valid);
+th_d_c   = th_dot_v(idx_valid);
+tau_d_c  = tau_dot_v(idx_valid);
+Y_real_c = tau_ctrl_v_filt(idx_valid); 
+
+% reference interpolation
+q_d_interp    = interp1(t_val, q_val, tv_c, 'linear', 'extrap');
+acc_d_interp  = interp1(t_val, acc_val, tv_c, 'linear', 'extrap');
+tau_Jd_ref_v = M * acc_d_interp;
+th_d_ref_v   = q_d_interp + (tau_Jd_ref_v / K);
+
+% Regressor matrix
+e_tau = tau_Jd_ref_v - tau_c;
+d_tau = -tau_d_c;
+e_th  = th_d_ref_v - th_c;
+d_th  = -th_d_c;
+
+Phi_val = [e_tau, d_tau, e_th, d_th];
+
+% Prediction
+Tau_predicted = Phi_val * Gains_est;
+
+% FIT
+err_val  = Y_real_c - Tau_predicted;
+fit_val  = 100 * (1 - norm(err_val)/norm(Y_real_c - mean(Y_real_c)));
+
+fprintf('Validation Results: FIT = %.2f%%\n', fit_val);
+
+% --- 7. PLOT ---
+figure('Name','Temporal Validation','Color','w');
+
+subplot(3,1,1);
+plot(t_val, q_val, 'k', 'LineWidth', 2); grid on;
+title('Desired Lin Trajectory (q)'); ylabel('Pos [rad]');
+
+subplot(3,1,2);
+plot(tv_c, Y_real_c, 'b', 'LineWidth', 1.5); hold on;
+plot(tv_c, Tau_predicted, 'r--', 'LineWidth', 1.5);
+title(['Control Torque: Real vs Predicted (Fit: ' num2str(fit_val,'%.1f') '%)']);
+legend('Real', 'Estimated'); ylabel('Torque [Nm]'); grid on;
+
+subplot(3,1,3);
+plot(tv_c, err_val, 'k');
+title('Residual Error'); xlabel('Time [s]'); ylabel('[Nm]'); grid on;
